@@ -9,8 +9,8 @@
       "console": "integratedTerminal",
       "python": "${workspaceFolder}/.venv/Scripts/python.exe",
       "env": {
-        "HTTP_PROXY": "http://127.0.0.1:7890",
-        "HTTPS_PROXY": "http://127.0.0.1:7890",
+        "HTTP_PROXY": "http://127.0.0.1:7897",
+        "HTTPS_PROXY": "http://127.0.0.1:7897",
         "NO_PROXY": "localhost,127.0.0.1"
       }
     },
@@ -22,8 +22,8 @@
       "console": "integratedTerminal",
       "python": "${workspaceFolder}/.venv/Scripts/python.exe",
       "env": {
-        "HTTP_PROXY": "http://127.0.0.1:7890",
-        "HTTPS_PROXY": "http://127.0.0.1:7890",
+        "HTTP_PROXY": "http://127.0.0.1:7897",
+        "HTTPS_PROXY": "http://127.0.0.1:7897",
         "NO_PROXY": "localhost,127.0.0.1"
       }
     }
