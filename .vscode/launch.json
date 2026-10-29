@@ -2,30 +2,14 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "验证 DeepMIMO 代理",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/proxy_check.py",
-      "console": "integratedTerminal",
-      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
-      "env": {
-        "HTTP_PROXY": "http://127.0.0.1:7897",
-        "HTTPS_PROXY": "http://127.0.0.1:7897",
-        "NO_PROXY": "localhost,127.0.0.1",
-        "PYTHONIOENCODING": "utf-8"
-      }
-    },
-    {
-      "name": "下载 DeepMIMO O1_28",
+      "name": "生成少量 DeepMIMO 数据集",
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/test.py",
+      "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "python": "${workspaceFolder}/.venv/Scripts/python.exe",
       "env": {
-        "HTTP_PROXY": "http://127.0.0.1:7897",
-        "HTTPS_PROXY": "http://127.0.0.1:7897",
-        "NO_PROXY": "localhost,127.0.0.1",
         "PYTHONIOENCODING": "utf-8"
       }
     }
