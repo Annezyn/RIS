@@ -1,0 +1,15 @@
+# Python runtime artifacts
+.venv/
+__pycache__/
+*.py[cod]
+
+# Downloaded DeepMIMO scenarios and generated datasets
+deepmimo_scenarios/
+deepmimo_rt_sources/
+stm32_dataset/
+
+# Editable third-party DeepMIMO checkout
+DeepMIMO/
+
+# VS Code local state
+.vscode/*.log
