@@ -2,10 +2,10 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "生成少量 DeepMIMO 数据集",
+      "name": "生成完整 DeepMIMO 训练数据集",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/test.py",
+      "program": "${workspaceFolder}/generate_full_dataset.py",
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "python": "${workspaceFolder}/.venv/Scripts/python.exe",
