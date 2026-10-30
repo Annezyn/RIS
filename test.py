@@ -30,7 +30,7 @@ def make_ris_codebook(ris_side: int) -> tuple[np.ndarray, np.ndarray]:
 
 # ---------- 常用配置：调试时通常只需要修改 NUM_USERS ----------
 SCENARIO = "o1_28"
-NUM_USERS = 10
+NUM_USERS = 100
 RIS_BS = 4
 RIS_SIDE = 32
 M = RIS_SIDE * RIS_SIDE
@@ -48,14 +48,6 @@ UE_START_ROW, UE_START_COL = 1000 - 1, 1 - 1
 PROJECT_DIR = Path(__file__).resolve().parent
 OUT = PROJECT_DIR / "stm32_dataset"
 OUT.mkdir(exist_ok=True)
-
-# ---------- 只检查本地场景，不再联网下载 ----------
-scenario_dir = PROJECT_DIR / "deepmimo_scenarios" / SCENARIO
-if not scenario_dir.is_dir():
-    raise FileNotFoundError(
-        f"没有找到场景：{scenario_dir}\n"
-        "请先安装或解压 o1_28；本脚本不会自动联网下载。"
-    )
 
 # 已验证 O1_28 的 UE 网格接收集编号为 0
 UE_RX_SET = 0
