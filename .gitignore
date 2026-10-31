@@ -2,6 +2,8 @@
 .venv/
 __pycache__/
 *.py[cod]
+*.npy
+*.pth
 
 # Downloaded DeepMIMO scenarios and generated datasets
 deepmimo_scenarios/
