@@ -80,8 +80,8 @@ OUTPUT_DIM = 1024
 DEFAULT_EPOCHS = 50
 DEFAULT_BATCH_SIZE = 64
 DEFAULT_LEARNING_RATE = 1e-3
-DEFAULT_WEIGHT_DECAY = 1e-4
-DEFAULT_DROPOUT = 0.1
+DEFAULT_SCALE_FACTOR = 1
+DEFAULT_HIDDEN_LAYERS = 3
 DEFAULT_GRAD_CLIP = 5.0
 DEFAULT_NUM_WORKERS = 0
 DEFAULT_SEED = 42
@@ -213,32 +213,47 @@ class RISRegressionDataset(Dataset):
 
 
 class RISCodebookMLP(nn.Module):
-    """Lightweight fully connected regressor: 1024-512-256-512-1024.
+    """Paper-style fully connected RIS achievable-rate regressor.
 
     输入层接收 1024 维采样 CSI 特征，输出层产生 1024 个连续速率评分。
     每个输出维度对应一个 RIS 码本；输出层不接 softmax 或 sigmoid。
+
+    隐藏层宽度遵循论文公式 [IF/G, 4*IF/G, 4*IF/G]，其中 IF=1024。
+    hl 指定使用的隐藏层数量，支持 0、1、2、3；每个隐藏层后只接 ReLU。
     """
 
-    def __init__(self, dropout: float = DEFAULT_DROPOUT) -> None:
-        """构建三层隐藏层的纯 MLP，并在隐藏层后使用 ReLU 和 Dropout。"""
+    def __init__(
+        self,
+        hidden_layers: int = 3,
+        scale_factor: int = 1,
+    ) -> None:
+        """按论文宽度公式构建纯 MLP，不使用 Dropout。"""
         super().__init__()
-        self.network = nn.Sequential(
-            # [B, 1024] -> [B, 512]
-            nn.Linear(INPUT_DIM, 512),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            # [B, 512] -> [B, 256]
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            # [B, 256] -> [B, 512]
-            nn.Linear(256, 512),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            # No activation: the output is a continuous 1024-score vector.
-            # [B, 512] -> [B, 1024]，输出为回归评分，不做分类概率归一化。
-            nn.Linear(512, OUTPUT_DIM),
+        if scale_factor <= 0:
+            raise ValueError("--G must be a positive integer.")
+        if not 0 <= hidden_layers <= 3:
+            raise ValueError("--hl must be between 0 and 3.")
+
+        paper_widths = (
+            INPUT_DIM // scale_factor,
+            (4 * INPUT_DIM) // scale_factor,
+            (4 * INPUT_DIM) // scale_factor,
         )
+        if hidden_layers > 0 and paper_widths[0] <= 0:
+            raise ValueError("--G is too large for the 1024-dimensional input.")
+
+        self.hidden_dims = paper_widths[:hidden_layers]
+        layers: list[nn.Module] = []
+        previous_dim = INPUT_DIM
+        for hidden_dim in self.hidden_dims:
+            # [B, D_in] -> [B, D_hidden]
+            layers.append(nn.Linear(previous_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            previous_dim = hidden_dim
+
+        # No activation: [B, D_last] -> [B, 1024] continuous rate scores.
+        layers.append(nn.Linear(previous_dim, OUTPUT_DIM))
+        self.network = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """执行前向传播。
@@ -468,14 +483,16 @@ def evaluate(
 def load_trained_model(
     weight_path: str | Path = DEFAULT_WEIGHT_PATH,
     device: torch.device | None = None,
-    dropout: float = DEFAULT_DROPOUT,
+    scale_factor: int = DEFAULT_SCALE_FACTOR,
+    hidden_layers: int = DEFAULT_HIDDEN_LAYERS,
 ) -> tuple[RISCodebookMLP, torch.device]:
     """Reconstruct the model and load saved weights for inference.
 
     Args:
         weight_path: 保存 state_dict 的 .pth 文件。
         device: 推理设备；None 时自动选择 CUDA/CPU。
-        dropout: 仅用于构建相同网络结构，推理时 Dropout 会被关闭。
+        scale_factor: 论文宽度公式中的缩放因子 G。
+        hidden_layers: 隐藏层数量 hl。
 
     Returns:
         model: 已加载权重并处于 eval 模式的 MLP。
@@ -489,11 +506,14 @@ def load_trained_model(
         device = select_device()
 
     # 网络结构必须与训练时一致，state_dict 才能正确加载。
-    model = RISCodebookMLP(dropout=dropout).to(device)
-    # state_dict 包含各 Linear/ReLU/Dropout 层的参数张量。
+    model = RISCodebookMLP(
+        scale_factor=scale_factor,
+        hidden_layers=hidden_layers,
+    ).to(device)
+    # state_dict 包含各 Linear 层的参数张量。
     state_dict = torch.load(weight_path, map_location=device)
     model.load_state_dict(state_dict)
-    # 关闭 Dropout，进入确定性推理模式。
+    # 进入确定性推理模式。
     model.eval()
     return model, device
 
@@ -534,7 +554,7 @@ def predict_best_codebook(
             f"got {feature_tensor.numel()}."
         )
 
-    # 推理阶段关闭 Dropout。
+    # 推理阶段使用 eval 模式。
     model.eval()
     # [1024] -> [1, 1024]；scores 形状为 [1, 1024]。
     scores = model(feature_tensor.unsqueeze(0).to(device))
@@ -547,7 +567,7 @@ def train_mlp(args: argparse.Namespace) -> Path:
 
     Args:
         args: 命令行参数集合，包含数据目录、epoch、batch、学习率、
-            Dropout、weight decay、梯度裁剪阈值等。
+            G、hl、梯度裁剪阈值等。
 
     Returns:
         最佳验证集 Top1 权重文件路径。
@@ -556,10 +576,12 @@ def train_mlp(args: argparse.Namespace) -> Path:
         raise ValueError("--epochs must be positive.")
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be positive.")
-    if not 0.0 <= args.dropout < 1.0:
-        raise ValueError("--dropout must satisfy 0 <= dropout < 1.")
+    if args.G <= 0:
+        raise ValueError("--G must be a positive integer.")
+    if not 0 <= args.hl <= 3:
+        raise ValueError("--hl must be between 0 and 3.")
 
-    # 固定随机种子，使 Dropout 和训练 batch shuffle 可复现。
+    # 固定随机种子，使参数初始化和训练 batch shuffle 可复现。
     set_random_seed(args.seed)
     # 优先使用 GPU；无 GPU 时自动使用 CPU。
     device = select_device()
@@ -594,15 +616,21 @@ def train_mlp(args: argparse.Namespace) -> Path:
     print(f"Validation samples: {len(validation_indices):,}")
     print(f"Test samples: {len(test_indices):,}")
 
-    # 模型输入 [B, 1024]，输出 [B, 1024]。
-    model = RISCodebookMLP(dropout=args.dropout).to(device)
+    # 模型输入 [B, 1024]，输出 [B, 1024]；宽度由论文 G 和 hl 决定。
+    model = RISCodebookMLP(
+        hidden_layers=args.hl,
+        scale_factor=args.G,
+    ).to(device)
+    print(
+        f"MLP hidden dimensions (HL={args.hl}, G={args.G}): "
+        f"{list(model.hidden_dims)}"
+    )
     # MSE 对 batch 内所有码本评分计算均方误差。
     criterion = nn.MSELoss()
-    # Adam 优化器；weight_decay 用于抑制过拟合。
+    # 按论文消融设置保留 Adam，不设置 weight_decay。
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=args.learning_rate,
-        weight_decay=args.weight_decay,
     )
 
     best_validation_loss = float("inf")
@@ -709,6 +737,8 @@ def inference_example(
     weight_path: str | Path = DEFAULT_WEIGHT_PATH,
     sample_index: int = 0,
     feature: np.ndarray | torch.Tensor | None = None,
+    scale_factor: int = DEFAULT_SCALE_FACTOR,
+    hidden_layers: int = DEFAULT_HIDDEN_LAYERS,
 ) -> int:
     """Predict one codebook index from a supplied or file-loaded feature.
 
@@ -728,7 +758,12 @@ def inference_example(
         feature = np.array(features[sample_index], dtype=np.float32, copy=True)
 
     # 重建网络、加载权重并自动选择 CUDA/CPU。
-    model, device = load_trained_model(weight_path, device=select_device())
+    model, device = load_trained_model(
+        weight_path,
+        device=select_device(),
+        scale_factor=scale_factor,
+        hidden_layers=hidden_layers,
+    )
     # 对单条特征 [1024] 执行 argmax，得到 RIS 码本编号。
     best_index = predict_best_codebook(model, feature, device)
     print(f"Sample {sample_index}: best RIS codebook index = {best_index}")
@@ -761,11 +796,17 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_LEARNING_RATE,
     )
     parser.add_argument(
-        "--weight-decay",
-        type=float,
-        default=DEFAULT_WEIGHT_DECAY,
+        "--G",
+        type=int,
+        default=DEFAULT_SCALE_FACTOR,
+        help="Paper width scaling factor G.",
     )
-    parser.add_argument("--dropout", type=float, default=DEFAULT_DROPOUT)
+    parser.add_argument(
+        "--hl",
+        type=int,
+        default=DEFAULT_HIDDEN_LAYERS,
+        help="Number of hidden layers (0 to 3).",
+    )
     parser.add_argument(
         "--grad-clip",
         type=float,
@@ -801,6 +842,8 @@ if __name__ == "__main__":
             data_dir=cli_args.data_dir,
             weight_path=cli_args.weights,
             sample_index=cli_args.sample_index,
+            scale_factor=cli_args.G,
+            hidden_layers=cli_args.hl,
         )
     else:
         # 使用磁盘真实数据和外部索引完整训练 MLP。
