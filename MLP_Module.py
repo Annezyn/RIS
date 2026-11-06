@@ -21,10 +21,12 @@ RIS 码本选择任务的 MLP 训练与推理模块。
 
 评估指标:
     Top1 准确率，即预测评分 argmax 与真实 Y 行 argmax 相同的比例。
+    avg_rate (R_plot)，即预测速率向量最大值的样本均值；genie-aided
+    上界为真实 Y 速率向量最大值的样本均值。
 
 数据集来源:
-    DeepMIMO O1_28 射线追踪场景；训练集和验证集划分来自外部索引文件，
-    本模块不会重新随机切分数据。
+    DeepMIMO O1_28 射线追踪场景；训练集、验证集和独立测试集划分来自
+    外部索引文件，本模块不会重新随机切分数据。
 
 通信术语:
     级联信道: BS -> RIS 与 UE -> RIS 两段信道逐单元相乘，描述信号经
@@ -36,6 +38,7 @@ RIS 码本选择任务的 MLP 训练与推理模块。
 from __future__ import annotations
 
 import argparse
+import csv
 import random
 from pathlib import Path
 
@@ -48,13 +51,25 @@ from torch.utils.data import DataLoader, Dataset
 SCRIPT_DIR = Path(__file__).resolve().parent
 # 默认权重文件放在脚本所在目录，便于训练和推理共用同一路径。
 DEFAULT_WEIGHT_PATH = SCRIPT_DIR / "ris_mlp_weight.pth"
+DEFAULT_LOG_PATH = SCRIPT_DIR / "train_log.csv"
+TRAIN_LOG_FIELDNAMES = (
+    "epoch",
+    "train_loss",
+    "val_loss",
+    "val_Top1_acc",
+    "val_avg_rate",
+    "test_Top1_acc",
+    "test_avg_rate",
+    "test_genie_rate",
+)
 
-# 训练所需的外部数据文件：输入、标签、训练索引、验证索引。
+# 训练所需的外部数据文件：输入、标签、训练、验证和独立测试索引。
 DATA_FILENAMES = (
     "X.npy",
     "Y.npy",
     "train_indices.npy",
-    "validation_indices.npy",
+    "val_indices.npy",
+    "test_indices.npy",
 )
 
 # X 每条样本为 1024 维；同时对应 1024 个候选 RIS 码本。
@@ -73,7 +88,7 @@ DEFAULT_SEED = 42
 
 
 def resolve_data_dir(explicit_dir: str | None = None) -> Path:
-    """Find the directory containing all four dataset files.
+    """Find the directory containing all required dataset files.
 
     The explicit path has highest priority. Otherwise, check the current
     working directory, this script's directory, and its parent directory.
@@ -97,15 +112,15 @@ def resolve_data_dir(explicit_dir: str | None = None) -> Path:
         if candidate in checked:
             continue
         checked.append(candidate)
-        # 四个文件同时存在时，才认为该目录是有效数据集目录。
+        # 全部数据文件同时存在时，才认为该目录是有效数据集目录。
         if all((candidate / name).is_file() for name in DATA_FILENAMES):
             return candidate
 
     # 找不到完整数据集时给出已检查路径，便于定位路径配置问题。
     checked_text = "\n".join(f"  - {path}" for path in checked)
     raise FileNotFoundError(
-        "Could not find X.npy, Y.npy, train_indices.npy, and "
-        f"validation_indices.npy. Checked:\n{checked_text}\n"
+        "Could not find X.npy, Y.npy, train_indices.npy, "
+        f"val_indices.npy, and test_indices.npy. Checked:\n{checked_text}\n"
         "Pass the correct directory with --data-dir."
     )
 
@@ -132,7 +147,7 @@ class RISRegressionDataset(Dataset):
     数据视图:
         x_data: [N, 1024]，每条样本为带噪采样级联 CSI 特征。
         y_data: [N, 1024]，每条样本为 1024 个码本的归一化速率评分。
-        indices: [N_split]，外部训练或验证划分中的原始样本行号。
+        indices: [N_split]，外部训练、验证或测试划分中的原始样本行号。
 
     由于数组通过 mmap 只读打开，完整数据集不会一次性复制到内存或显存。
     """
@@ -243,14 +258,23 @@ def build_dataloaders(
     num_workers: int,
     seed: int,
     device: torch.device,
-) -> tuple[DataLoader, DataLoader, np.ndarray, np.ndarray]:
-    """Build loaders using exactly the provided train/validation indices.
+) -> tuple[
+    DataLoader,
+    DataLoader,
+    DataLoader,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    """Build loaders using exactly the provided train/validation/test indices.
 
     返回:
         train_loader: 训练 DataLoader，每个 batch 形状 [B, 1024]。
         validation_loader: 验证 DataLoader，每个 batch 形状 [B, 1024]。
+        test_loader: 独立测试 DataLoader，每个 batch 形状 [B, 1024]。
         train_indices: [N_train]，外部训练索引。
         validation_indices: [N_val]，外部验证索引。
+        test_indices: [N_test]，外部独立测试索引。
 
     DataLoader 的 shuffle 只改变 batch 顺序，不会重新划分数据集。
     """
@@ -263,9 +287,10 @@ def build_dataloaders(
     y_data = np.load(y_path, mmap_mode="r")
     # X 已由数据生成器按全局 x_scale 归一化，Y 的每行已按自身最大值归一化。
     # 本训练模块不再重复缩放，避免改变原始 CSI 相对幅度和标签排序。
-    # train_indices: [N_train]；validation_indices: [N_val]。
+    # train_indices: [N_train]；validation_indices: [N_val]；test_indices: [N_test]。
     train_indices = np.load(data_dir / "train_indices.npy")
-    validation_indices = np.load(data_dir / "validation_indices.npy")
+    validation_indices = np.load(data_dir / "val_indices.npy")
+    test_indices = np.load(data_dir / "test_indices.npy")
 
     # 特征维度和码本评分维度分别为 1024；不一致时立即报错。
     if x_data.shape[1] != INPUT_DIM or y_data.shape[1] != OUTPUT_DIM:
@@ -274,17 +299,22 @@ def build_dataloaders(
             f"{INPUT_DIM}/{OUTPUT_DIM}, got "
             f"{x_data.shape[1]}/{y_data.shape[1]}."
         )
-    # 训练集与验证集禁止重叠，防止验证指标泄漏。
-    if np.intersect1d(train_indices, validation_indices).size:
-        raise ValueError("Training and validation indices overlap.")
+    # 训练集、验证集和独立测试集禁止重叠，防止数据泄漏。
+    if (
+        np.intersect1d(train_indices, validation_indices).size
+        or np.intersect1d(train_indices, test_indices).size
+        or np.intersect1d(validation_indices, test_indices).size
+    ):
+        raise ValueError("Training, validation, and test indices overlap.")
 
-    # 两个 Dataset 共享同一组 mmap 数组，但使用不同的外部索引。
+    # 三个 Dataset 共享同一组 mmap 数组，但使用不同的外部索引。
     train_dataset = RISRegressionDataset(x_data, y_data, train_indices)
     validation_dataset = RISRegressionDataset(
         x_data,
         y_data,
         validation_indices,
     )
+    test_dataset = RISRegressionDataset(x_data, y_data, test_indices)
 
     loader_options = {
         # num_workers=0 在 Windows/Jupyter 下最稳妥。
@@ -302,7 +332,7 @@ def build_dataloaders(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,  # Shuffle batches only; never perform a new split.
-        # 仅打乱已有训练索引的顺序，不改变训练/验证集组成。
+        # 仅打乱已有训练索引的顺序，不改变训练/验证/测试集组成。
         generator=shuffle_generator,
         **loader_options,
     )
@@ -312,7 +342,20 @@ def build_dataloaders(
         shuffle=False,
         **loader_options,
     )
-    return train_loader, validation_loader, train_indices, validation_indices
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        **loader_options,
+    )
+    return (
+        train_loader,
+        validation_loader,
+        test_loader,
+        train_indices,
+        validation_indices,
+        test_indices,
+    )
 
 
 def train_one_epoch(
@@ -368,18 +411,28 @@ def evaluate(
     dataloader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
-) -> tuple[float, float]:
-    """Return weighted validation MSE and Top-1 codebook accuracy.
+) -> tuple[float, float, float, float]:
+    """Return loss, Top-1 accuracy, predicted average rate, and genie rate.
 
     Top1 判定:
         对预测 [B, 1024] 沿码本维度 argmax，得到预测码本索引 [B]；
         对真实 Y [B, 1024] 沿码本维度 argmax，得到真实码本索引 [B]；
         两者逐样本比较后计算正确率。
+
+    论文式 (13) 的 R_plot:
+        对每个样本的预测速率向量取最大预测速率，再对数据划分内所有
+        样本求均值。
+
+    genie-aided 上界:
+        对每个样本的真实 Y 速率向量取最大速率，再对数据划分内所有
+        样本求均值。本地 Y 是归一化速率，因此指标也位于 0~1。
     """
     # 验证模式会关闭 Dropout，并使用当前参数做确定性推理。
     model.eval()
     total_loss = 0.0
     total_correct = 0
+    total_avg_rate = 0.0
+    total_genie_rate = 0.0
     total_samples = 0
 
     for x_batch, y_batch in dataloader:
@@ -393,16 +446,23 @@ def evaluate(
 
         # Derive the true best codebook directly from each Y row.
         # predicted_indices: [B]；true_indices: [B]，取值范围 0~1023。
-        predicted_indices = predictions.argmax(dim=1)
-        true_indices = y_batch.argmax(dim=1)
+        predicted_rates, predicted_indices = predictions.max(dim=1)
+        genie_rates, true_indices = y_batch.max(dim=1)
 
-        # 按样本数累加损失和正确数，最后统一计算平均值。
+        # 按样本数累加损失、正确数、预测速率和 genie 上界速率。
         batch_size = x_batch.size(0)
         total_loss += loss.item() * batch_size
         total_correct += (predicted_indices == true_indices).sum().item()
+        total_avg_rate += predicted_rates.sum().item()
+        total_genie_rate += genie_rates.sum().item()
         total_samples += batch_size
 
-    return total_loss / total_samples, total_correct / total_samples
+    return (
+        total_loss / total_samples,
+        total_correct / total_samples,
+        total_avg_rate / total_samples,
+        total_genie_rate / total_samples,
+    )
 
 
 def load_trained_model(
@@ -503,7 +563,7 @@ def train_mlp(args: argparse.Namespace) -> Path:
     set_random_seed(args.seed)
     # 优先使用 GPU；无 GPU 时自动使用 CPU。
     device = select_device()
-    # 解析包含四个 .npy 文件的数据目录。
+    # 解析包含训练、验证和独立测试索引的数据目录。
     data_dir = resolve_data_dir(args.data_dir)
     # 权重保存路径；必要时创建父目录。
     weight_path = Path(args.weights).expanduser().resolve()
@@ -514,18 +574,25 @@ def train_mlp(args: argparse.Namespace) -> Path:
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(device)}")
 
-    train_loader, validation_loader, train_indices, validation_indices = (
-        build_dataloaders(
-            data_dir=data_dir,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            seed=args.seed,
-            device=device,
-        )
+    (
+        train_loader,
+        validation_loader,
+        test_loader,
+        train_indices,
+        validation_indices,
+        test_indices,
+    ) = build_dataloaders(
+        data_dir=data_dir,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        seed=args.seed,
+        device=device,
     )
+    # test_loader is used only after training and best-checkpoint loading.
     # train_indices: [N_train]；validation_indices: [N_val]。
     print(f"Training samples: {len(train_indices):,}")
     print(f"Validation samples: {len(validation_indices):,}")
+    print(f"Test samples: {len(test_indices):,}")
 
     # 模型输入 [B, 1024]，输出 [B, 1024]。
     model = RISCodebookMLP(dropout=args.dropout).to(device)
@@ -540,6 +607,11 @@ def train_mlp(args: argparse.Namespace) -> Path:
 
     best_validation_loss = float("inf")
     best_top1_accuracy = -1.0
+    log_path = DEFAULT_LOG_PATH
+    with log_path.open("w", newline="", encoding="utf-8") as log_file:
+        log_writer = csv.DictWriter(log_file, fieldnames=TRAIN_LOG_FIELDNAMES)
+        log_writer.writeheader()
+    print(f"Training log: {log_path}")
 
     for epoch in range(1, args.epochs + 1):
         # 跑完一个 epoch 的全部训练 batch，返回平均 train MSE。
@@ -551,8 +623,8 @@ def train_mlp(args: argparse.Namespace) -> Path:
             device,
             args.grad_clip,
         )
-        # 在外部验证索引上计算验证 MSE 和 Top1 码本准确率。
-        validation_loss, top1_accuracy = evaluate(
+        # 验证集计算 MSE、Top1 码本准确率和论文 R_plot 预测平均速率。
+        validation_loss, top1_accuracy, validation_avg_rate, _ = evaluate(
             model,
             validation_loader,
             criterion,
@@ -564,8 +636,24 @@ def train_mlp(args: argparse.Namespace) -> Path:
             f"Epoch {epoch:03d}/{args.epochs:03d} | "
             f"train_loss={train_loss:.6f} | "
             f"val_loss={validation_loss:.6f} | "
-            f"Top1_acc={top1_accuracy:.4%}"
+            f"Top1_acc={top1_accuracy:.4%} | "
+            f"val_avg_rate={validation_avg_rate:.6f}"
         )
+
+        with log_path.open("a", newline="", encoding="utf-8") as log_file:
+            log_writer = csv.DictWriter(
+                log_file,
+                fieldnames=TRAIN_LOG_FIELDNAMES,
+            )
+            log_writer.writerow(
+                {
+                    "epoch": epoch,
+                    "train_loss": f"{train_loss:.6f}",
+                    "val_loss": f"{validation_loss:.6f}",
+                    "val_Top1_acc": f"{top1_accuracy:.6f}",
+                    "val_avg_rate": f"{validation_avg_rate:.6f}",
+                }
+            )
 
         # 以验证 Top1 为首要选模指标；Top1 相同时再比较验证 MSE。
         if (
@@ -589,6 +677,30 @@ def train_mlp(args: argparse.Namespace) -> Path:
     print(f"Best validation Top1 accuracy: {best_top1_accuracy:.4%}")
     print(f"Best validation loss: {best_validation_loss:.6f}")
     print(f"Weights saved to: {weight_path}")
+
+    # Evaluate test only once, after training and best-checkpoint loading.
+    _, test_top1_accuracy, test_avg_rate, test_genie_rate = evaluate(
+        model,
+        test_loader,
+        criterion,
+        device,
+    )
+    print(
+        f"Test metrics | test_Top1_acc={test_top1_accuracy:.4%} | "
+        f"test_avg_rate={test_avg_rate:.6f} | "
+        f"test_genie_rate={test_genie_rate:.6f}"
+    )
+
+    with log_path.open("a", newline="", encoding="utf-8") as log_file:
+        log_writer = csv.DictWriter(log_file, fieldnames=TRAIN_LOG_FIELDNAMES)
+        log_writer.writerow(
+            {
+                "epoch": "test",
+                "test_Top1_acc": f"{test_top1_accuracy:.6f}",
+                "test_avg_rate": f"{test_avg_rate:.6f}",
+                "test_genie_rate": f"{test_genie_rate:.6f}",
+            }
+        )
     return weight_path
 
 
@@ -631,7 +743,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-dir",
         default=None,
-        help="Directory containing X.npy, Y.npy, and the split indices.",
+        help=(
+            "Directory containing X.npy, Y.npy, and train/validation/test "
+            "split indices."
+        ),
     )
     parser.add_argument(
         "--weights",
