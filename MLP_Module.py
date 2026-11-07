@@ -76,15 +76,24 @@ DATA_FILENAMES = (
 INPUT_DIM = 1024
 OUTPUT_DIM = 1024
 
-# 默认训练超参数；batch 64 兼顾 RTX 4050 6 GB 显存和训练效率。
-DEFAULT_EPOCHS = 50
-DEFAULT_BATCH_SIZE = 64
-DEFAULT_LEARNING_RATE = 1e-3
+# 默认训练超参数对齐论文训练器。
+DEFAULT_EPOCHS = 200
+DEFAULT_BATCH_SIZE = 500
+DEFAULT_LEARNING_RATE = 0.1
+DEFAULT_SGD_MOMENTUM = 0.0
 DEFAULT_SCALE_FACTOR = 1
 DEFAULT_HIDDEN_LAYERS = 3
 DEFAULT_GRAD_CLIP = 5.0
 DEFAULT_NUM_WORKERS = 0
 DEFAULT_SEED = 42
+
+# 论文 ReduceLROnPlateau 与 early stopping 配置。
+LR_SCHEDULER_FACTOR = 0.75
+LR_SCHEDULER_PATIENCE = 4
+LR_SCHEDULER_THRESHOLD = 1e-3
+LR_SCHEDULER_MIN_LR = 1e-4
+EARLY_STOPPING_PATIENCE = 10
+EARLY_STOPPING_MIN_DELTA = 5e-4
 
 
 def resolve_data_dir(explicit_dir: str | None = None) -> Path:
@@ -409,7 +418,7 @@ def train_one_epoch(
         loss.backward()
         # 限制梯度的全局范数，降低训练不稳定或梯度爆炸的风险。
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-        # 使用 Adam 更新网络参数。
+        # 使用 SGD 更新网络参数。
         optimizer.step()
 
         # 按当前 batch 样本数加权，最后得到整个 epoch 的平均损失。
@@ -570,7 +579,7 @@ def train_mlp(args: argparse.Namespace) -> Path:
             G、hl、梯度裁剪阈值等。
 
     Returns:
-        最佳验证集 Top1 权重文件路径。
+        最佳验证集 loss 权重文件路径。
     """
     if args.epochs <= 0:
         raise ValueError("--epochs must be positive.")
@@ -627,14 +636,28 @@ def train_mlp(args: argparse.Namespace) -> Path:
     )
     # MSE 对 batch 内所有码本评分计算均方误差。
     criterion = nn.MSELoss()
-    # 按论文消融设置保留 Adam，不设置 weight_decay。
-    optimizer = torch.optim.Adam(
+    # 论文使用普通 SGD；Keras SGD 未指定动量时默认为 0.0。
+    optimizer = torch.optim.SGD(
         model.parameters(),
         lr=args.learning_rate,
+        momentum=DEFAULT_SGD_MOMENTUM,
+        weight_decay=0.0,
+    )
+    # 调度器监控验证集 loss，按论文参数逐步降低学习率。
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=LR_SCHEDULER_FACTOR,
+        patience=LR_SCHEDULER_PATIENCE,
+        threshold=LR_SCHEDULER_THRESHOLD,
+        threshold_mode="abs",
+        min_lr=LR_SCHEDULER_MIN_LR,
     )
 
     best_validation_loss = float("inf")
+    early_stopping_reference_loss = float("inf")
     best_top1_accuracy = -1.0
+    epochs_without_improvement = 0
     log_path = DEFAULT_LOG_PATH
     with log_path.open("w", newline="", encoding="utf-8") as log_file:
         log_writer = csv.DictWriter(log_file, fieldnames=TRAIN_LOG_FIELDNAMES)
@@ -683,26 +706,41 @@ def train_mlp(args: argparse.Namespace) -> Path:
                 }
             )
 
-        # 以验证 Top1 为首要选模指标；Top1 相同时再比较验证 MSE。
-        if (
-            top1_accuracy > best_top1_accuracy
-            or (
-                top1_accuracy == best_top1_accuracy
-                and validation_loss < best_validation_loss
-            )
-        ):
+        # 只要验证 loss 创新低就保存当前最优模型。
+        if validation_loss < best_validation_loss:
             best_top1_accuracy = top1_accuracy
             best_validation_loss = validation_loss
             # 仅保存模型参数 state_dict，不保存优化器和数据。
             torch.save(model.state_dict(), weight_path)
 
+        # 早停只计算达到最小改进幅度的验证 loss 改善。
+        if (
+            validation_loss
+            < early_stopping_reference_loss - EARLY_STOPPING_MIN_DELTA
+        ):
+            early_stopping_reference_loss = validation_loss
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
+        # 调度器步进必须在验证 loss 计算完成之后。
+        scheduler.step(validation_loss)
+
+        if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
+            print(
+                "Early stopping: validation loss did not improve by at least "
+                f"{EARLY_STOPPING_MIN_DELTA:g} for "
+                f"{EARLY_STOPPING_PATIENCE} consecutive epochs."
+            )
+            break
+
     # Reload the best validation checkpoint so subsequent inference is consistent.
-    # 将内存中的模型恢复为验证集 Top1 最优权重。
+    # 将内存中的模型恢复为验证集 loss 最优权重。
     state_dict = torch.load(weight_path, map_location=device)
     model.load_state_dict(state_dict)
     model.eval()
 
-    print(f"Best validation Top1 accuracy: {best_top1_accuracy:.4%}")
+    print(f"Top1 accuracy at best validation loss: {best_top1_accuracy:.4%}")
     print(f"Best validation loss: {best_validation_loss:.6f}")
     print(f"Weights saved to: {weight_path}")
 
