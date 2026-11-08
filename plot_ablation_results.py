@@ -158,7 +158,8 @@ def plot_convergence(log_path: Path, output_dir: Path) -> None:
 
     loss_axis.set_xlabel("Epoch")
     loss_axis.set_ylabel("MSE loss")
-    metric_axis.set_ylabel("Normalized average rate")
+    metric_axis.set_ylabel("Normalized average rate (subcarrier-0 only)")
+    loss_axis.set_title("Convergence (average rate: subcarrier-0 only)")
     loss_axis.set_xlim(series["epoch"][0], series["epoch"][-1])
     loss_axis.set_ylim(bottom=0.0)
     loss_axis.xaxis.set_major_locator(MaxNLocator(nbins=10, integer=True))
@@ -206,8 +207,8 @@ def plot_ablation_summary(
         label="Test average rate",
     )
     depth_axis.set_xlabel("Number of hidden layers, hl")
-    depth_axis.set_ylabel("Performance (%)")
-    depth_axis.set_title("Depth ablation (G = 1)")
+    depth_axis.set_ylabel("Normalized average rate (%) - subcarrier-0")
+    depth_axis.set_title("Depth ablation (G = 1, subcarrier-0 rate)")
     depth_axis.set_xticks(depth_hl)
     depth_axis.set_ylim(0.0, 105.0)
 
@@ -224,8 +225,8 @@ def plot_ablation_summary(
         label="Test average rate",
     )
     width_axis.set_xlabel("Width scaling factor, G")
-    width_axis.set_ylabel("Performance (%)")
-    width_axis.set_title("Width ablation (hl = 3)")
+    width_axis.set_ylabel("Normalized average rate (%) - subcarrier-0")
+    width_axis.set_title("Width ablation (hl = 3, subcarrier-0 rate)")
     width_axis.set_xticks(width_g)
     width_axis.set_ylim(90.0, 101.2)
 

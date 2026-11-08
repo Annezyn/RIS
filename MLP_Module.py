@@ -22,6 +22,8 @@ RIS 码本选择任务的 MLP 训练与推理模块。
 评估指标:
     avg_rate (R_plot)，即预测速率向量最大值的样本均值；genie-aided
     上界为真实 Y 速率向量最大值的样本均值。
+    注意：当前数据集标签、avg_rate 和 genie_rate 均仅使用 OFDM 子载波 0，
+    不是论文中全部子载波的平均速率，和论文完整指标存在差异。
 
 数据集来源:
     DeepMIMO O1_28 射线追踪场景；训练集、验证集和独立测试集划分来自
@@ -86,9 +88,9 @@ OUTPUT_DIM = 1024
 # 默认训练超参数对齐论文训练器。
 DEFAULT_EPOCHS = 200
 DEFAULT_BATCH_SIZE = 500
-DEFAULT_LEARNING_RATE = 0.01
-DEFAULT_SGD_MOMENTUM = 0.9
-DEFAULT_WEIGHT_DECAY = 1e-4
+DEFAULT_LEARNING_RATE = 0.1
+DEFAULT_SGD_MOMENTUM = 0.0
+DEFAULT_WEIGHT_DECAY = 0.0
 DEFAULT_SCALE_FACTOR = 1
 DEFAULT_HIDDEN_LAYERS = 3
 DEFAULT_GRAD_CLIP = 5.0
@@ -467,6 +469,7 @@ def train_one_epoch(
 # 统一计算验证集或测试集 loss、R_plot 和 genie-aided 速率。
 # ============================================================================
 
+# 当前 avg_rate 和 genie_rate 基于仅使用 OFDM 子载波 0 的数据集标签计算。
 @torch.no_grad()
 def evaluate(
     model: nn.Module,
