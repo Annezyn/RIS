@@ -20,7 +20,6 @@ RIS 码本选择任务的 MLP 训练与推理模块。
     对模型输出的 1024 个评分执行 argmax，得到最优 RIS 码本编号。
 
 评估指标:
-    Top1 准确率，即预测评分 argmax 与真实 Y 行 argmax 相同的比例。
     avg_rate (R_plot)，即预测速率向量最大值的样本均值；genie-aided
     上界为真实 Y 速率向量最大值的样本均值。
 
@@ -35,6 +34,11 @@ RIS 码本选择任务的 MLP 训练与推理模块。
     子载波: OFDM 频域信道采样点；每条输入样本使用 64 个子载波。
 """
 
+# ============================================================================
+# 模块 01：导入依赖
+# 汇总训练、评估、推理和命令行解析所需的 Python 与 PyTorch 依赖。
+# ============================================================================
+
 from __future__ import annotations
 
 import argparse
@@ -48,6 +52,11 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 
+# ============================================================================
+# 模块 02：全局配置与文件常量
+# 统一定义默认数据文件、模型尺寸、训练超参数和输出日志字段。
+# ============================================================================
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 # 默认权重文件放在脚本所在目录，便于训练和推理共用同一路径。
 DEFAULT_WEIGHT_PATH = SCRIPT_DIR / "ris_mlp_weight.pth"
@@ -56,9 +65,7 @@ TRAIN_LOG_FIELDNAMES = (
     "epoch",
     "train_loss",
     "val_loss",
-    "val_Top1_acc",
     "val_avg_rate",
-    "test_Top1_acc",
     "test_avg_rate",
     "test_genie_rate",
 )
@@ -79,8 +86,9 @@ OUTPUT_DIM = 1024
 # 默认训练超参数对齐论文训练器。
 DEFAULT_EPOCHS = 200
 DEFAULT_BATCH_SIZE = 500
-DEFAULT_LEARNING_RATE = 0.1
-DEFAULT_SGD_MOMENTUM = 0.0
+DEFAULT_LEARNING_RATE = 0.01
+DEFAULT_SGD_MOMENTUM = 0.9
+DEFAULT_WEIGHT_DECAY = 1e-4
 DEFAULT_SCALE_FACTOR = 1
 DEFAULT_HIDDEN_LAYERS = 3
 DEFAULT_GRAD_CLIP = 5.0
@@ -95,6 +103,11 @@ LR_SCHEDULER_MIN_LR = 1e-4
 EARLY_STOPPING_PATIENCE = 10
 EARLY_STOPPING_MIN_DELTA = 5e-4
 
+
+# ============================================================================
+# 模块 03：运行环境与数据路径辅助
+# 负责定位真实数据集目录、固定随机种子并选择 GPU 或 CPU。
+# ============================================================================
 
 def resolve_data_dir(explicit_dir: str | None = None) -> Path:
     """Find the directory containing all required dataset files.
@@ -149,6 +162,11 @@ def select_device() -> torch.device:
     # 优先使用 CUDA GPU；没有可用 GPU 时自动退回 CPU。
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
+# ============================================================================
+# 模块 04：RIS 数据集类
+# 使用外部索引按需读取带噪级联 CSI 和对应的码本速率评分。
+# ============================================================================
 
 class RISRegressionDataset(Dataset):
     """Map provided split indices to on-demand samples from memory maps.
@@ -221,6 +239,11 @@ class RISRegressionDataset(Dataset):
         return torch.from_numpy(x_sample), torch.from_numpy(y_sample)
 
 
+# ============================================================================
+# 模块 05：MLP 模型定义
+# 按论文宽度公式构建从 CSI 特征到 1024 个码本评分的纯 MLP 回归器。
+# ============================================================================
+
 class RISCodebookMLP(nn.Module):
     """Paper-style fully connected RIS achievable-rate regressor.
 
@@ -275,6 +298,11 @@ class RISCodebookMLP(nn.Module):
         """
         return self.network(x)
 
+
+# ============================================================================
+# 模块 06：数据加载模块
+# 按给定训练、验证和测试索引构建按需加载的 DataLoader。
+# ============================================================================
 
 def build_dataloaders(
     data_dir: Path,
@@ -382,6 +410,11 @@ def build_dataloaders(
     )
 
 
+# ============================================================================
+# 模块 07：单轮训练循环
+# 完成一个 epoch 的前向传播、MSE 损失计算、反向传播和参数更新。
+# ============================================================================
+
 def train_one_epoch(
     model: nn.Module,
     dataloader: DataLoader,
@@ -429,19 +462,19 @@ def train_one_epoch(
     return total_loss / total_samples
 
 
+# ============================================================================
+# 模块 08：评估指标计算
+# 统一计算验证集或测试集 loss、R_plot 和 genie-aided 速率。
+# ============================================================================
+
 @torch.no_grad()
 def evaluate(
     model: nn.Module,
     dataloader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
-) -> tuple[float, float, float, float]:
-    """Return loss, Top-1 accuracy, predicted average rate, and genie rate.
-
-    Top1 判定:
-        对预测 [B, 1024] 沿码本维度 argmax，得到预测码本索引 [B]；
-        对真实 Y [B, 1024] 沿码本维度 argmax，得到真实码本索引 [B]；
-        两者逐样本比较后计算正确率。
+) -> tuple[float, float, float]:
+    """Return loss, predicted average rate, and genie rate.
 
     论文式 (13) 的 R_plot:
         对每个样本的预测速率向量取最大预测速率，再对数据划分内所有
@@ -454,7 +487,6 @@ def evaluate(
     # 验证模式会关闭 Dropout，并使用当前参数做确定性推理。
     model.eval()
     total_loss = 0.0
-    total_correct = 0
     total_avg_rate = 0.0
     total_genie_rate = 0.0
     total_samples = 0
@@ -468,26 +500,28 @@ def evaluate(
         predictions = model(x_batch)
         loss = criterion(predictions, y_batch)
 
-        # Derive the true best codebook directly from each Y row.
-        # predicted_indices: [B]；true_indices: [B]，取值范围 0~1023。
-        predicted_rates, predicted_indices = predictions.max(dim=1)
-        genie_rates, true_indices = y_batch.max(dim=1)
+        # predicted_rates: [B]；genie_rates: [B]。
+        predicted_rates = predictions.max(dim=1).values
+        genie_rates = y_batch.max(dim=1).values
 
-        # 按样本数累加损失、正确数、预测速率和 genie 上界速率。
+        # 按样本数累加损失、预测速率和 genie 上界速率。
         batch_size = x_batch.size(0)
         total_loss += loss.item() * batch_size
-        total_correct += (predicted_indices == true_indices).sum().item()
         total_avg_rate += predicted_rates.sum().item()
         total_genie_rate += genie_rates.sum().item()
         total_samples += batch_size
 
     return (
         total_loss / total_samples,
-        total_correct / total_samples,
         total_avg_rate / total_samples,
         total_genie_rate / total_samples,
     )
 
+
+# ============================================================================
+# 模块 09：权重加载与推理辅助
+# 重建训练时的模型结构、加载权重并从单条 CSI 特征预测最优码本编号。
+# ============================================================================
 
 def load_trained_model(
     weight_path: str | Path = DEFAULT_WEIGHT_PATH,
@@ -571,6 +605,11 @@ def predict_best_codebook(
     return int(scores.argmax(dim=1).item())
 
 
+# ============================================================================
+# 模块 10：完整训练流程
+# 组织数据加载、训练、验证、学习率调度、早停、最优权重保存和最终测试。
+# ============================================================================
+
 def train_mlp(args: argparse.Namespace) -> Path:
     """执行完整训练、验证、最佳权重保存和权重恢复。
 
@@ -636,12 +675,19 @@ def train_mlp(args: argparse.Namespace) -> Path:
     )
     # MSE 对 batch 内所有码本评分计算均方误差。
     criterion = nn.MSELoss()
-    # 论文使用普通 SGD；Keras SGD 未指定动量时默认为 0.0。
+    # 这是论文对应的 SGD 优化器；此前基线使用的 Adam 优化器在这里明确区分。
+    # 初始参数 lr=0.01、momentum=0.9、weight_decay=1e-4 均可由命令行覆盖。
     optimizer = torch.optim.SGD(
         model.parameters(),
         lr=args.learning_rate,
-        momentum=DEFAULT_SGD_MOMENTUM,
-        weight_decay=0.0,
+        momentum=args.momentum,
+        weight_decay=args.weight_decay,
+    )
+    print(
+        "Optimizer: SGD | "
+        f"lr={args.learning_rate:g} | "
+        f"momentum={args.momentum:g} | "
+        f"weight_decay={args.weight_decay:g}"
     )
     # 调度器监控验证集 loss，按论文参数逐步降低学习率。
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -656,7 +702,6 @@ def train_mlp(args: argparse.Namespace) -> Path:
 
     best_validation_loss = float("inf")
     early_stopping_reference_loss = float("inf")
-    best_top1_accuracy = -1.0
     epochs_without_improvement = 0
     log_path = DEFAULT_LOG_PATH
     with log_path.open("w", newline="", encoding="utf-8") as log_file:
@@ -674,20 +719,19 @@ def train_mlp(args: argparse.Namespace) -> Path:
             device,
             args.grad_clip,
         )
-        # 验证集计算 MSE、Top1 码本准确率和论文 R_plot 预测平均速率。
-        validation_loss, top1_accuracy, validation_avg_rate, _ = evaluate(
+        # 验证集计算 MSE、论文 R_plot 预测平均速率和 genie 上界速率。
+        validation_loss, validation_avg_rate, _ = evaluate(
             model,
             validation_loader,
             criterion,
             device,
         )
 
-        # 每轮输出训练损失、验证损失和 Top1 准确率。
+        # 每轮输出训练损失、验证损失和验证平均速率。
         print(
             f"Epoch {epoch:03d}/{args.epochs:03d} | "
             f"train_loss={train_loss:.6f} | "
             f"val_loss={validation_loss:.6f} | "
-            f"Top1_acc={top1_accuracy:.4%} | "
             f"val_avg_rate={validation_avg_rate:.6f}"
         )
 
@@ -701,14 +745,12 @@ def train_mlp(args: argparse.Namespace) -> Path:
                     "epoch": epoch,
                     "train_loss": f"{train_loss:.6f}",
                     "val_loss": f"{validation_loss:.6f}",
-                    "val_Top1_acc": f"{top1_accuracy:.6f}",
                     "val_avg_rate": f"{validation_avg_rate:.6f}",
                 }
             )
 
         # 只要验证 loss 创新低就保存当前最优模型。
         if validation_loss < best_validation_loss:
-            best_top1_accuracy = top1_accuracy
             best_validation_loss = validation_loss
             # 仅保存模型参数 state_dict，不保存优化器和数据。
             torch.save(model.state_dict(), weight_path)
@@ -740,19 +782,17 @@ def train_mlp(args: argparse.Namespace) -> Path:
     model.load_state_dict(state_dict)
     model.eval()
 
-    print(f"Top1 accuracy at best validation loss: {best_top1_accuracy:.4%}")
     print(f"Best validation loss: {best_validation_loss:.6f}")
-    print(f"Weights saved to: {weight_path}")
+    print(f"Final validation avg_rate: {validation_avg_rate:.6f}")
 
     # Evaluate test only once, after training and best-checkpoint loading.
-    _, test_top1_accuracy, test_avg_rate, test_genie_rate = evaluate(
+    _, test_avg_rate, test_genie_rate = evaluate(
         model,
         test_loader,
         criterion,
         device,
     )
     print(
-        f"Test metrics | test_Top1_acc={test_top1_accuracy:.4%} | "
         f"test_avg_rate={test_avg_rate:.6f} | "
         f"test_genie_rate={test_genie_rate:.6f}"
     )
@@ -762,13 +802,17 @@ def train_mlp(args: argparse.Namespace) -> Path:
         log_writer.writerow(
             {
                 "epoch": "test",
-                "test_Top1_acc": f"{test_top1_accuracy:.6f}",
                 "test_avg_rate": f"{test_avg_rate:.6f}",
                 "test_genie_rate": f"{test_genie_rate:.6f}",
             }
         )
     return weight_path
 
+
+# ============================================================================
+# 模块 11：单样本推理示例
+# 从真实数据中读取一条 CSI 特征，调用训练好的模型输出最优 RIS 码本编号。
+# ============================================================================
 
 def inference_example(
     data_dir: str | Path | None = None,
@@ -808,6 +852,11 @@ def inference_example(
     return best_index
 
 
+# ============================================================================
+# 模块 12：命令行参数解析
+# 集中定义训练、模型缩放、推理和复现实验所需的命令行参数。
+# ============================================================================
+
 def parse_args() -> argparse.Namespace:
     """解析命令行参数，并返回 argparse.Namespace。"""
     parser = argparse.ArgumentParser(
@@ -832,6 +881,18 @@ def parse_args() -> argparse.Namespace:
         "--learning-rate",
         type=float,
         default=DEFAULT_LEARNING_RATE,
+    )
+    parser.add_argument(
+        "--momentum",
+        type=float,
+        default=DEFAULT_SGD_MOMENTUM,
+        help="Momentum for the paper-aligned SGD optimizer.",
+    )
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=DEFAULT_WEIGHT_DECAY,
+        help="Weight decay (L2 regularization) for the SGD optimizer.",
     )
     parser.add_argument(
         "--G",
@@ -870,6 +931,11 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
+
+# ============================================================================
+# 模块 13：程序主入口
+# 根据是否传入 --inference 选择单样本推理或完整训练流程。
+# ============================================================================
 
 if __name__ == "__main__":
     # 直接运行脚本时：默认训练；指定 --inference 时只执行单样本推理。

@@ -36,7 +36,7 @@ BASELINE_G = 1
 BASELINE_HL = 3
 
 COLOR_LOSS = "#1F4E79"
-COLOR_TOP1 = "#C44E52"
+COLOR_VAL_LOSS = "#D97706"
 COLOR_RATE = "#2E8B57"
 
 
@@ -83,14 +83,14 @@ def load_convergence(path: Path) -> dict[str, list[float]]:
     series: dict[str, list[float]] = {
         "epoch": [],
         "train_loss": [],
-        "val_Top1_acc": [],
+        "val_loss": [],
         "val_avg_rate": [],
     }
     for row in epoch_rows:
         try:
             series["epoch"].append(float(row["epoch"]))
             series["train_loss"].append(float(row["train_loss"]))
-            series["val_Top1_acc"].append(float(row["val_Top1_acc"]))
+            series["val_loss"].append(float(row["val_loss"]))
             series["val_avg_rate"].append(float(row["val_avg_rate"]))
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(
@@ -99,8 +99,8 @@ def load_convergence(path: Path) -> dict[str, list[float]]:
     return series
 
 
-def load_test_metrics(path: Path) -> tuple[float, float]:
-    """Read the final test Top-1 accuracy and normalized average rate."""
+def load_test_avg_rate(path: Path) -> float:
+    """Read the final normalized test average rate."""
     test_rows = [
         row for row in read_csv_rows(path) if row.get("epoch", "").strip() == "test"
     ]
@@ -111,11 +111,10 @@ def load_test_metrics(path: Path) -> tuple[float, float]:
 
     row = test_rows[0]
     try:
-        test_top1 = float(row["test_Top1_acc"])
         test_avg_rate = float(row["test_avg_rate"])
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"Incomplete test metrics in {path}") from exc
-    return test_top1, test_avg_rate
+    return test_avg_rate
 
 
 def style_axis(axis: plt.Axes) -> None:
@@ -127,25 +126,26 @@ def style_axis(axis: plt.Axes) -> None:
 
 
 def plot_convergence(log_path: Path, output_dir: Path) -> None:
-    """Create Figure 1 with loss on the left axis and metrics on the right."""
+    """Create Figure 1 with train/validation loss and validation average rate."""
     series = load_convergence(log_path)
 
     fig, loss_axis = plt.subplots(figsize=(7.2, 4.4))
     metric_axis = loss_axis.twinx()
 
-    loss_line = loss_axis.plot(
+    train_loss_line = loss_axis.plot(
         series["epoch"],
         series["train_loss"],
         color=COLOR_LOSS,
         linewidth=1.65,
         label="Training loss",
     )[0]
-    top1_line = metric_axis.plot(
+    val_loss_line = loss_axis.plot(
         series["epoch"],
-        series["val_Top1_acc"],
-        color=COLOR_TOP1,
+        series["val_loss"],
+        color=COLOR_VAL_LOSS,
         linewidth=1.55,
-        label="Validation Top-1 accuracy",
+        linestyle="--",
+        label="Validation loss",
     )[0]
     rate_line = metric_axis.plot(
         series["epoch"],
@@ -157,18 +157,16 @@ def plot_convergence(log_path: Path, output_dir: Path) -> None:
     )[0]
 
     loss_axis.set_xlabel("Epoch")
-    loss_axis.set_ylabel("Training loss", color=COLOR_LOSS)
-    metric_axis.set_ylabel("Top-1 accuracy / normalized average rate")
+    loss_axis.set_ylabel("MSE loss")
+    metric_axis.set_ylabel("Normalized average rate")
     loss_axis.set_xlim(series["epoch"][0], series["epoch"][-1])
     loss_axis.set_ylim(bottom=0.0)
-    metric_axis.set_ylim(0.80, 1.01)
     loss_axis.xaxis.set_major_locator(MaxNLocator(nbins=10, integer=True))
 
-    loss_axis.tick_params(axis="y", colors=COLOR_LOSS)
     style_axis(loss_axis)
     style_axis(metric_axis)
     loss_axis.legend(
-        handles=[loss_line, top1_line, rate_line],
+        handles=[train_loss_line, val_loss_line, rate_line],
         loc="upper center",
         bbox_to_anchor=(0.5, 1.14),
         ncol=3,
@@ -188,26 +186,17 @@ def plot_convergence(log_path: Path, output_dir: Path) -> None:
 
 
 def plot_ablation_summary(
-    metrics: dict[tuple[int, int], tuple[float, float]],
+    metrics: dict[tuple[int, int], float],
     output_dir: Path,
 ) -> None:
     """Create Figure 2 with separate depth and width ablation panels."""
     fig, axes = plt.subplots(1, 2, figsize=(9.2, 4.1))
-    marker_top1 = "o"
     marker_rate = "s"
 
     depth_hl = [0, 1, 2, 3]
-    depth_top1 = [100.0 * metrics[(1, hl)][0] for hl in depth_hl]
-    depth_rate = [100.0 * metrics[(1, hl)][1] for hl in depth_hl]
+    depth_rate = [100.0 * metrics[(1, hl)] for hl in depth_hl]
 
     depth_axis = axes[0]
-    depth_axis.plot(
-        depth_hl,
-        depth_top1,
-        color=COLOR_TOP1,
-        marker=marker_top1,
-        label="Test Top-1 accuracy",
-    )
     depth_axis.plot(
         depth_hl,
         depth_rate,
@@ -223,17 +212,9 @@ def plot_ablation_summary(
     depth_axis.set_ylim(0.0, 105.0)
 
     width_g = [1, 2, 4]
-    width_top1 = [100.0 * metrics[(g, 3)][0] for g in width_g]
-    width_rate = [100.0 * metrics[(g, 3)][1] for g in width_g]
+    width_rate = [100.0 * metrics[(g, 3)] for g in width_g]
 
     width_axis = axes[1]
-    width_axis.plot(
-        width_g,
-        width_top1,
-        color=COLOR_TOP1,
-        marker=marker_top1,
-        label="Test Top-1 accuracy",
-    )
     width_axis.plot(
         width_g,
         width_rate,
@@ -272,16 +253,16 @@ def main() -> None:
     configure_matplotlib()
 
     paths = {key: SCRIPT_DIR / name for key, name in LOG_FILES.items()}
-    metrics = {key: load_test_metrics(path) for key, path in paths.items()}
+    metrics = {key: load_test_avg_rate(path) for key, path in paths.items()}
 
     plot_convergence(paths[(BASELINE_G, BASELINE_HL)], SCRIPT_DIR)
     plot_ablation_summary(metrics, SCRIPT_DIR)
 
     print("\nFinal test metrics used in Figure 2:")
-    for (scale_factor, hidden_layers), (top1, avg_rate) in metrics.items():
+    for (scale_factor, hidden_layers), avg_rate in metrics.items():
         print(
             f"G={scale_factor}, hl={hidden_layers}: "
-            f"Top1={100.0 * top1:.4f}%, avg_rate={avg_rate:.6f}"
+            f"avg_rate={avg_rate:.6f}"
         )
 
 
