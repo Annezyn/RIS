@@ -7,6 +7,8 @@ __pycache__/
 deepmimo_scenarios/
 deepmimo_rt_sources/
 stm32_dataset/
+stm32_dataset_512/
+stm32_sample_512/
 
 # Editable third-party DeepMIMO checkout
 DeepMIMO/
