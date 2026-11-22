@@ -1,0 +1,1 @@
+stm32_dataset_512.zip filter=lfs diff=lfs merge=lfs -text
